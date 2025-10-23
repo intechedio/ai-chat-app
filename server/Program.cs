@@ -124,6 +124,8 @@ app.MapPost("/api/chat", async (HttpContext context) =>
     }
     catch (Exception ex)
     {
+        Console.WriteLine($"Chat API Error: {ex.Message}");
+        Console.WriteLine($"Stack Trace: {ex.StackTrace}");
         context.Response.StatusCode = 500;
         await context.Response.WriteAsync($"data: {{\"error\": \"Internal server error: {ex.Message}\"}}\n\n");
     }
@@ -252,7 +254,7 @@ async Task HandleRealtimeConnection(WebSocket webSocket, IConfiguration configur
             {
                 type = "realtime",
                 model = model,
-                // Enable audio output only (text is not supported with audio)
+                // Enable audio output only
                 output_modalities = new[] { "audio" },
                 audio = new
                 {
@@ -278,7 +280,7 @@ async Task HandleRealtimeConnection(WebSocket webSocket, IConfiguration configur
                         voice = "alloy"
                     }
                 },
-                instructions = "You are a helpful AI assistant. Respond to the user's voice messages with speech only. Keep responses concise and natural."
+                instructions = "You are a helpful AI assistant. Keep responses concise and natural."
             }
         };
 
@@ -361,8 +363,7 @@ async Task RelayMessages(WebSocket source, WebSocket destination, string directi
                 var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
                 Console.WriteLine($"{direction} relay: Received text message: {message.Substring(0, Math.Min(message.Length, 200))}");
                 
-                // Check for error messages from OpenAI
-                if (message.Contains("\"type\":\"error\""))
+/*                 if (message.Contains("\"type\":\"error\""))
                 {
                     Console.WriteLine($"{direction} relay: OpenAI API error detected: {message}");
                 }
@@ -371,7 +372,7 @@ async Task RelayMessages(WebSocket source, WebSocket destination, string directi
                 if (message.Contains("\"type\":\"input_audio_buffer.append\""))
                 {
                     Console.WriteLine($"{direction} relay: Audio buffer append message received");
-                }
+                } */
             }
             else if (result.MessageType == WebSocketMessageType.Binary)
             {

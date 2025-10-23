@@ -61,9 +61,9 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
       const audioBuffer = audioContext.createBuffer(1, pcm16Data.length, 24000);
       const channelData = audioBuffer.getChannelData(0);
       
-      // Convert PCM16 to Float32Array for Web Audio API
+      // converting PCM16 to Float32Array for Web Audio API
       for (let i = 0; i < pcm16Data.length; i++) {
-        channelData[i] = pcm16Data[i] / 32768.0; // Convert from 16-bit to float
+        channelData[i] = pcm16Data[i] / 32768.0;
       }
       
       // Create and play audio
@@ -95,7 +95,7 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
-      // Wait for WebSocket to be ready and session to be established
+      // waiting for WebSocket to be ready and session to be established
       await new Promise<void>((resolve, reject) => {
         let sessionEstablished = false;
         
@@ -203,7 +203,7 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
               userSpeechBuffer.current = '';
             } else if (message.type === 'input_audio_buffer.speech_stopped') {
               console.log('User speech stopped');
-              // Add user speech transcript to chat if we have content
+              // streaming user speech to OpenAI
               if (userSpeechBuffer.current && onAddMessage) {
                 onAddMessage({
                   role: 'user',
@@ -508,7 +508,7 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
     });
   }, []);
 
-  // Cleanup on unmount
+  // Cleanup on disconnection
   useEffect(() => {
     return () => {
       disconnect();

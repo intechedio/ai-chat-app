@@ -26,7 +26,7 @@ function App() {
     isPlayingResponse,
     isReceivingResponse
   } = useAudioStream((message) => {
-    // Add the AI response to the chat messages with streaming support
+    // streaming chat messages from OpenAI
     addMessage(message.content, message.role as 'user' | 'assistant', {
       isStreaming: message.isStreaming,
       messageId: message.messageId,
