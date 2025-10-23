@@ -170,19 +170,6 @@ VITE_API_BASE_URL=http://localhost:5000
    - Check that the backend is running
    - Verify the WebSocket URL in the browser console
 
-### Development Tips
-
-- Use browser developer tools to monitor network requests
-- Check the backend console for error logs
-- Test with different browsers (Chrome recommended for WebRTC)
-
-## 🚀 Production Deployment
-
-### Backend
-- Deploy to Azure App Service, AWS, or any .NET hosting
-- Set `OPENAI_API_KEY` as environment variable
-- Configure CORS for your domain
-
 ### Frontend
 - Build: `npm run build`
 - Deploy to Vercel, Netlify, or any static hosting
