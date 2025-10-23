@@ -26,3 +26,4 @@ dist-ssr
 **/bin/
 **/obj/
 appsettings.json
+start-server.ps1
