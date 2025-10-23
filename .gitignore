@@ -25,4 +25,4 @@ dist-ssr
 
 **/bin/
 **/obj/
-appsettings*.json
+appsettings.json
