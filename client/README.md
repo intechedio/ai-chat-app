@@ -193,25 +193,6 @@ npm run dev
 - Clear conversation
 - Error display
 
-## 🎯 User Experience
-
-### Responsive Design
-- Mobile-first approach
-- Adaptive layouts
-- Touch-friendly controls
-- Optimized for various screen sizes
-
-### Accessibility
-- Keyboard navigation
-- Screen reader support
-- High contrast colors
-- Focus indicators
-
-### Performance
-- Lazy loading
-- Efficient re-renders
-- Optimized audio processing
-- Minimal bundle size
 
 ## 🔌 API Integration
 
@@ -252,65 +233,9 @@ const ws = new WebSocket(`${wsUrl}/api/realtime`);
 - Invalid responses
 - Graceful degradation
 
-## 🧪 Testing
-
-### Manual Testing
-- Cross-browser compatibility
-- Mobile responsiveness
-- Voice functionality
-- Error scenarios
-
-### Recommended Browsers
-- Chrome (best WebRTC support)
-- Firefox
-- Safari (limited WebRTC)
-- Edge
-
 ## 🚀 Production Build
 
 ### Build Process
 ```bash
 npm run build
 ```
-
-### Output
-- Optimized bundle
-- Minified code
-- Tree-shaken dependencies
-- Static assets
-
-### Deployment
-- Static hosting (Vercel, Netlify)
-- CDN distribution
-- Environment variable configuration
-
-## 🔧 Customization
-
-### Adding New Voices
-1. Update voice options in App.tsx
-2. Ensure backend supports the voice
-3. Test TTS functionality
-
-### Styling Changes
-1. Modify TailwindCSS classes
-2. Update component styles
-3. Test responsive design
-
-### Feature Extensions
-1. Add new hooks for functionality
-2. Create new components
-3. Update App.tsx integration
-
-## 📊 Performance Monitoring
-
-### Key Metrics
-- Bundle size
-- Load time
-- Audio latency
-- Memory usage
-
-### Optimization Tips
-- Code splitting
-- Lazy loading
-- Audio buffer optimization
-- Efficient re-renders
