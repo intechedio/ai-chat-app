@@ -12,7 +12,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [selectedVoice, setSelectedVoice] = useState('alloy');
 
-  const { messages, isLoading, error, sendMessage, clearMessages, addMessage } = useChatStream();
+  const { messages, isLoading, error, sendMessage, clearMessages, addMessage, cancel } = useChatStream();
   const { isPlaying, speak } = useTextToSpeech();
   const {
     isConnected,
@@ -163,6 +163,7 @@ function App() {
               isInCall={isInCall}
               isVoiceMode={isVoiceMode}
               onToggleMode={handleToggleMode}
+              onCancel={cancel}
             />
           </div>
         </div>

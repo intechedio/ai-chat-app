@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 
 export interface Message {
   id: string;
@@ -21,6 +21,8 @@ export const useChatStream = () => {
     error: null
   });
 
+  const abortRef = useRef<AbortController | null>(null);
+
   const sendMessage = useCallback(async (content: string) => {
     if (!content.trim()) return;
 
@@ -40,34 +42,35 @@ export const useChatStream = () => {
 
     try {
       const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5198';
-      
+
+      // cancel any in-flight request first
+      abortRef.current?.abort();
+      abortRef.current = new AbortController();
+
       const response = await fetch(`${apiBaseUrl}/api/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
+          'Cache-Control': 'no-cache'
         },
         body: JSON.stringify({
-          messages: [...state.messages, userMessage].map(msg => ({
-            role: msg.role,
-            content: msg.content
-          }))
-        })
+          messages: [...state.messages, userMessage].map(m => ({ role: m.role, content: m.content }))
+        }),
+        signal: abortRef.current.signal
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
+      if (!response.ok || !response.body) {
+        const msg = `HTTP ${response.status}`;
+        throw new Error(msg);
       }
 
       const assistantMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
         content: '',
-        timestamp: new Date()
+        timestamp: new Date(),
+        isStreaming: true
       };
 
       setState(prev => ({
@@ -75,81 +78,113 @@ export const useChatStream = () => {
         messages: [...prev.messages, assistantMessage]
       }));
 
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = '';
+      let pending = '';
 
       while (true) {
         const { done, value } = await reader.read();
-        
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        pending += decoder.decode(value, { stream: true });
 
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            
-            if (data === '[DONE]') {
-              setState(prev => ({ ...prev, isLoading: false }));
-              return;
-            }
+        // split on LF, keep remainder in pending
+        const parts = pending.split('\n');
+        pending = parts.pop() ?? '';
 
-            try {
-              const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              
-              if (content) {
-                setState(prev => ({
-                  ...prev,
-                  messages: prev.messages.map(msg => 
-                    msg.id === assistantMessage.id 
-                      ? { ...msg, content: msg.content + content }
-                      : msg
-                  )
-                }));
-              }
-            } catch (e) {
-              // Ignore parsing errors for incomplete chunks
+        for (let raw of parts) {
+          const line = raw.trimEnd();
+          if (!line) {
+            // event delimiter — good time to flush UI
+            continue;
+          }
+
+          if (!line.startsWith('data:')) {
+            continue;
+          }
+
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') {
+            setState(prev => ({
+              ...prev,
+              isLoading: false,
+              messages: prev.messages.map(msg =>
+                msg.id === assistantMessage.id ? { ...msg, isStreaming: false } : msg
+              )
+            }));
+            abortRef.current = null;
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta;
+            const content = delta?.content ?? '';
+
+            if (content) {
+              setState(prev => ({
+                ...prev,
+                messages: prev.messages.map(msg =>
+                  msg.id === assistantMessage.id
+                    ? { ...msg, content: msg.content + content, isStreaming: true }
+                    : msg
+                )
+              }));
+
+              await new Promise(r => setTimeout(r, 0));
             }
+          } catch {
+            setState(prev => ({
+              ...prev,
+              error: data
+            }));
           }
         }
       }
 
-      setState(prev => ({ ...prev, isLoading: false }));
-    } catch (error) {
+      // stream ended without [DONE]
       setState(prev => ({
         ...prev,
         isLoading: false,
-        error: error instanceof Error ? error.message : 'An error occurred'
+        messages: prev.messages.map(msg =>
+          msg.id === assistantMessage.id ? { ...msg, isStreaming: false } : msg
+        )
       }));
+      abortRef.current = null;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return; // user canceled
+      setState(prev => ({
+        ...prev,
+        isLoading: false,
+        error: err instanceof Error ? err.message : 'Stream error'
+      }));
+      abortRef.current = null;
     }
   }, [state.messages]);
 
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setState(prev => ({ ...prev, isLoading: false }));
+  }, []);
+
   const clearMessages = useCallback(() => {
-    setState({
-      messages: [],
-      isLoading: false,
-      error: null
-    });
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setState({ messages: [], isLoading: false, error: null });
   }, []);
 
   const addMessage = useCallback((content: string, role: 'user' | 'assistant' = 'assistant', options?: { isStreaming?: boolean; messageId?: string; isUpdate?: boolean }) => {
     const messageId = options?.messageId || Date.now().toString();
-    
+
     if (options?.isUpdate) {
-      // Update existing message
       setState(prev => ({
         ...prev,
-        messages: prev.messages.map(msg => 
-          msg.id === messageId 
-            ? { ...msg, content: content.trim(), isStreaming: options.isStreaming }
-            : msg
+        messages: prev.messages.map(msg =>
+          msg.id === messageId ? { ...msg, content: content.trim(), isStreaming: options.isStreaming } : msg
         )
       }));
     } else {
-      // Add new message
       const message: Message = {
         id: messageId,
         role,
@@ -169,6 +204,7 @@ export const useChatStream = () => {
     ...state,
     sendMessage,
     clearMessages,
-    addMessage
+    addMessage,
+    cancel
   };
 };

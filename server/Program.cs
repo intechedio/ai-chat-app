@@ -59,20 +59,16 @@ app.MapPost("/api/chat", async (HttpContext context) =>
     try
     {
         using var reader = new StreamReader(context.Request.Body);
-        var requestBody = await reader.ReadToEndAsync();
-        
-        if (string.IsNullOrEmpty(requestBody))
+        var body = await reader.ReadToEndAsync();
+        if (string.IsNullOrWhiteSpace(body))
         {
             context.Response.StatusCode = 400;
             await context.Response.WriteAsync("Request body is required");
             return;
         }
 
-        var requestJson = JsonDocument.Parse(requestBody);
-        
-        var openAiClient = context.RequestServices.GetRequiredService<OpenAIClient>();
-        var messages = requestJson.RootElement.GetProperty("messages");
-        
+        var json = JsonDocument.Parse(body);
+        var messages = json.RootElement.GetProperty("messages");
         if (messages.ValueKind != JsonValueKind.Array || messages.GetArrayLength() == 0)
         {
             context.Response.StatusCode = 400;
@@ -80,54 +76,97 @@ app.MapPost("/api/chat", async (HttpContext context) =>
             return;
         }
 
-        // Create OpenAI request using the original approach but with the client
-        var model = requestJson.RootElement.TryGetProperty("model", out var modelProp) ? 
-                   modelProp.GetString() : app.Configuration["OpenAI:ChatModel"] ?? "gpt-4o";
-        
-        var maxTokens = requestJson.RootElement.TryGetProperty("max_tokens", out var maxTokensProp) ? 
-                       maxTokensProp.GetInt32() : 1000;
+        var model = json.RootElement.TryGetProperty("model", out var mProp)
+            ? mProp.GetString()
+            : app.Configuration["OpenAI:ChatModel"] ?? "gpt-4o";
+        var maxTokens = json.RootElement.TryGetProperty("max_tokens", out var mtProp)
+            ? mtProp.GetInt32()
+            : 1000;
 
         var openAiRequest = new
         {
-            model = model,
-            messages = messages,
+            model,
+            messages,
             stream = true,
             max_tokens = maxTokens
         };
 
-        // Use the OpenAI client's underlying HTTP client for streaming
-        using var httpClient = new HttpClient();
-        var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? 
-                    app.Configuration["OpenAI:ApiKey"];
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        
-        var content = new StringContent(JsonSerializer.Serialize(openAiRequest), 
-                                      Encoding.UTF8, "application/json");
+        // Prepare upstream request
+        var apiKey = Environment.GetEnvironmentVariable("OPENAI_OPENAI_API_KEY") 
+                     ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") 
+                     ?? app.Configuration["OpenAI:ApiKey"];
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            context.Response.StatusCode = 500;
+            await context.Response.WriteAsync("OpenAI API key not configured");
+            return;
+        }
 
-        var response = await httpClient.PostAsync("https://api.openai.com/v1/chat/completions", content);
-        
-        context.Response.StatusCode = (int)response.StatusCode;
+        using var httpClient = new HttpClient(new SocketsHttpHandler
+        {
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+            KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always,
+            KeepAlivePingDelay = TimeSpan.FromSeconds(15),
+            KeepAlivePingTimeout = TimeSpan.FromSeconds(5)
+        })
+        {
+            // Avoid default 100s timeout; SSE can be long-lived
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        httpClient.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        httpClient.DefaultRequestHeaders.Accept.ParseAdd("text/event-stream");
+
+        var content = new StringContent(JsonSerializer.Serialize(openAiRequest), Encoding.UTF8, "application/json");
+
+        // Prepare SSE response to the browser
+        context.Response.StatusCode = 200;
         context.Response.ContentType = "text/event-stream";
         context.Response.Headers["Cache-Control"] = "no-cache";
         context.Response.Headers["Connection"] = "keep-alive";
+        context.Response.Headers["X-Accel-Buffering"] = "no"; // Nginx: do not buffer
 
-        if (response.IsSuccessStatusCode)
+        using var upstream = await httpClient.PostAsync("https://api.openai.com/v1/chat/completions", content, context.RequestAborted);
+
+        if (!upstream.IsSuccessStatusCode)
         {
-            using var stream = await response.Content.ReadAsStreamAsync();
-            await stream.CopyToAsync(context.Response.Body);
+            var err = await upstream.Content.ReadAsStringAsync();
+            var sse = $"data: {err}\n\n";
+            await context.Response.WriteAsync(sse, context.RequestAborted);
+            await context.Response.Body.FlushAsync(context.RequestAborted);
+            return;
         }
-        else
+
+        // Stream the upstream SSE line by line to client
+        await using var stream = await upstream.Content.ReadAsStreamAsync(context.RequestAborted);
+        using var sr = new StreamReader(stream, Encoding.UTF8);
+
+        string? line;
+        while ((line = await sr.ReadLineAsync()) is not null && !context.RequestAborted.IsCancellationRequested)
         {
-            var errorContent = await response.Content.ReadAsStringAsync();
-            await context.Response.WriteAsync($"data: {errorContent}\n\n");
+            // Forward as-is; OpenAI already sends "data: ...", blank lines, and "[DONE]"
+            await context.Response.WriteAsync(line + "\n", context.RequestAborted);
+
+            // OpenAI sends a blank line to delimit events; keep it
+            if (string.IsNullOrEmpty(line))
+            {
+                await context.Response.Body.FlushAsync(context.RequestAborted);
+            }
         }
+
+        // Ensure a final flush
+        await context.Response.Body.FlushAsync(context.RequestAborted);
+    }
+    catch (OperationCanceledException)
+    {
+        // client disconnected / aborted
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Chat API Error: {ex.Message}");
-        Console.WriteLine($"Stack Trace: {ex.StackTrace}");
         context.Response.StatusCode = 500;
-        await context.Response.WriteAsync($"data: {{\"error\": \"Internal server error: {ex.Message}\"}}\n\n");
+        var err = $"data: {{\"error\":\"Internal server error: {ex.Message}\"}}\n\n";
+        await context.Response.WriteAsync(err);
     }
 });
 
@@ -233,6 +272,7 @@ async Task HandleRealtimeConnection(WebSocket webSocket, IConfiguration configur
 
     var buffer = new byte[1024 * 4];
     var openAiWebSocket = new ClientWebSocket();
+    openAiWebSocket.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
     
     try
     {
@@ -254,7 +294,6 @@ async Task HandleRealtimeConnection(WebSocket webSocket, IConfiguration configur
             {
                 type = "realtime",
                 model = model,
-                // Enable audio output only
                 output_modalities = new[] { "audio" },
                 audio = new
                 {
@@ -267,7 +306,7 @@ async Task HandleRealtimeConnection(WebSocket webSocket, IConfiguration configur
                         },
                         turn_detection = new
                         {
-                            type = "semantic_vad"
+                            type = "server_vad"
                         }
                     },
                     output = new

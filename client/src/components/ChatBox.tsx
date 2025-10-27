@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Mic, MicOff } from 'lucide-react';
+import { Send, Mic, MicOff, Square } from 'lucide-react';
 
 interface ChatBoxProps {
   onSendMessage: (message: string) => void;
@@ -9,6 +9,7 @@ interface ChatBoxProps {
   isInCall: boolean;
   isVoiceMode: boolean;
   onToggleMode: () => void;
+  onCancel?: () => void;
 }
 
 export const ChatBox: React.FC<ChatBoxProps> = ({
@@ -18,7 +19,8 @@ export const ChatBox: React.FC<ChatBoxProps> = ({
   onEndCall,
   isInCall,
   isVoiceMode,
-  onToggleMode
+  onToggleMode,
+  onCancel
 }) => {
   const [message, setMessage] = useState('');
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -133,13 +135,24 @@ export const ChatBox: React.FC<ChatBoxProps> = ({
               />
             </div>
             
-            <button
-              type="submit"
-              disabled={!message.trim() || isLoading}
-              className="p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex-shrink-0"
-            >
-              <Send size={20} />
-            </button>
+            {isLoading && onCancel ? (
+              <button
+                type="button"
+                onClick={onCancel}
+                className="p-3 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors flex-shrink-0"
+                title="Stop generating"
+              >
+                <Square size={20} />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!message.trim() || isLoading}
+                className="p-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex-shrink-0"
+              >
+                <Send size={20} />
+              </button>
+            )}
           </div>
           
           <div className="text-right text-xs text-gray-400">

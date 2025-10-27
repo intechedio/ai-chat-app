@@ -28,7 +28,6 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
   const animationFrameRef = useRef<number | null>(null);
   const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sessionReadyRef = useRef<boolean>(false);
-  const lastAudioSendTime = useRef<number>(0);
   const conversationItemCreated = useRef<boolean>(false);
   const isInCallActive = useRef<boolean>(false);
   const audioResponseBuffer = useRef<string>('');
@@ -36,11 +35,56 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
   const currentStreamingContent = useRef<string>('');
   const userSpeechBuffer = useRef<string>('');
   const userSpeechMessageId = useRef<string | null>(null);
+  const audioQueueRef = useRef<AudioBuffer[]>([]);
+  const isPlayingAudioRef = useRef<boolean>(false);
+  const hasUncommittedAudioRef = useRef<boolean>(false);
+  const responseInProgressRef = useRef<boolean>(false);
+  const uncommittedSamplesRef = useRef<number>(0);
+  const speechStopTimeoutRef = useRef<number | null>(null);
+  const pendingCreateTimeoutRef = useRef<number | null>(null);
+  const lastCommitAtRef = useRef<number>(0);
 
-  const playAudioResponse = useCallback(async (base64Audio: string) => {
+  // Commit at least 100ms of audio (24kHz = 2400 samples)
+  const MIN_COMMIT_SAMPLES = 2400;
+  // Wait briefly after speech_stopped to accumulate tail audio
+  const COMMIT_GRACE_MS = 120;
+  // Safety net: if server doesn't auto-create after commit, try once
+  const CREATE_FALLBACK_MS = 800;
+
+  const processAudioQueue = useCallback(async () => {
+    if (isPlayingAudioRef.current || audioQueueRef.current.length === 0) {
+      return;
+    }
+
+    isPlayingAudioRef.current = true;
+    setState(prev => ({ ...prev, isPlayingResponse: true }));
+
+    while (audioQueueRef.current.length > 0) {
+      const audioBuffer = audioQueueRef.current.shift();
+      if (!audioBuffer) break;
+
+      try {
+        const source = audioContextRef.current!.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContextRef.current!.destination);
+        
+        await new Promise<void>((resolve) => {
+          source.onended = () => resolve();
+          source.start();
+        });
+      } catch (error) {
+        console.error('Error playing audio buffer:', error);
+      }
+    }
+
+    isPlayingAudioRef.current = false;
+    setState(prev => ({ ...prev, isPlayingResponse: false }));
+  }, []);
+
+  const addAudioToQueue = useCallback(async (base64Audio: string) => {
     try {
-      if (!base64Audio) {
-        console.log('No audio data to play');
+      if (!base64Audio || !audioContextRef.current) {
+        console.log('No audio data or context to play');
         return;
       }
 
@@ -54,11 +98,8 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
       // Convert bytes to Int16Array (PCM16 format)
       const pcm16Data = new Int16Array(bytes.buffer);
       
-      // Create audio context
-      const audioContext = new AudioContext({ sampleRate: 24000 });
-      
       // Create audio buffer from PCM16 data
-      const audioBuffer = audioContext.createBuffer(1, pcm16Data.length, 24000);
+      const audioBuffer = audioContextRef.current.createBuffer(1, pcm16Data.length, 24000);
       const channelData = audioBuffer.getChannelData(0);
       
       // converting PCM16 to Float32Array for Web Audio API
@@ -66,23 +107,17 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
         channelData[i] = pcm16Data[i] / 32768.0;
       }
       
-      // Create and play audio
-      const source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(audioContext.destination);
-      source.start();
-
-      // Clean up when audio finishes
-      source.onended = () => {
-        audioContext.close();
-        setState(prev => ({ ...prev, isPlayingResponse: false }));
-      };
+      // Add to queue
+      audioQueueRef.current.push(audioBuffer);
+      
+      // Process queue
+      processAudioQueue();
 
     } catch (error) {
-      console.error('Error playing audio response:', error);
-      setState(prev => ({ ...prev, isPlayingResponse: false, error: 'Failed to play audio response' }));
+      console.error('Error processing audio response:', error);
+      setState(prev => ({ ...prev, error: 'Failed to process audio response' }));
     }
-  }, []);
+  }, [processAudioQueue]);
 
   const connect = useCallback(async () => {
     try {
@@ -117,14 +152,31 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
               setState(prev => ({ ...prev, sessionReady: true }));
               resolve();
             } else if (message.type === 'error') {
+              // Handle common realtime errors gracefully without surfacing to UI
+              const code = message.error?.code;
+              if (code === 'input_audio_buffer_commit_empty') {
+                console.warn('Commit rejected: not enough audio since last commit');
+                // Reset tracking so next commit can proceed when enough audio is present
+                hasUncommittedAudioRef.current = false;
+                uncommittedSamplesRef.current = 0;
+                return;
+              }
+              if (code === 'conversation_already_has_active_response') {
+                console.warn('Response already active; suppressing duplicate create');
+                return;
+              }
               console.error('Session error:', message.error);
               setState(prev => ({ ...prev, error: `Session error: ${message.error?.message || 'Unknown error'}` }));
+              responseInProgressRef.current = false;
+              hasUncommittedAudioRef.current = false;
               reject(new Error(`Session error: ${message.error?.message || 'Unknown error'}`));
-            } else if (message.type === 'response.output_audio.delta') {
-              // Handle audio response from the AI
-              console.log('Received audio response delta');
-              if (message.delta) {
-                audioResponseBuffer.current += message.delta;
+            } else if (message.type === 'response.created') {
+              console.log('Response created');
+              responseInProgressRef.current = true;
+              // Cancel any fallback create if it was scheduled
+              if (pendingCreateTimeoutRef.current) {
+                clearTimeout(pendingCreateTimeoutRef.current);
+                pendingCreateTimeoutRef.current = null;
               }
             } else if (message.type === 'response.output_audio_transcript.delta') {
               // Handle real-time transcript streaming
@@ -163,23 +215,27 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
                 audioResponseBuffer.current += message.delta;
                 setState(prev => ({ ...prev, isReceivingResponse: true }));
                 
-                // Play audio chunks as they arrive for real-time playback
-                if (audioResponseBuffer.current.length > 1000) { // Play when we have enough data
-                  playAudioResponse(audioResponseBuffer.current);
+                // Play audio chunks immediately for real-time playback
+                // Use larger threshold for smoother audio without pops/clicks
+                if (audioResponseBuffer.current.length >= 1500) { // ~>20ms worth; tweak 1500–3000
+                  addAudioToQueue(audioResponseBuffer.current);
                   audioResponseBuffer.current = ''; // Clear buffer after playing
                 }
               }
             } else if (message.type === 'response.output_audio.done') {
               console.log('Audio response completed');
-              setState(prev => ({ ...prev, isPlayingResponse: true }));
               
               // Play any remaining audio
               if (audioResponseBuffer.current) {
-                playAudioResponse(audioResponseBuffer.current);
+                addAudioToQueue(audioResponseBuffer.current);
               }
+            } else if (message.type === 'response.cancelled') {
+              console.log('Response cancelled');
+              responseInProgressRef.current = false;
             } else if (message.type === 'response.done') {
               console.log('Response completed');
               setState(prev => ({ ...prev, isPlayingResponse: false, isReceivingResponse: false }));
+              responseInProgressRef.current = false;
               
               // Finalize the streaming message
               if (currentStreamingMessageId.current && onAddMessage) {
@@ -201,17 +257,61 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
               // Reset user speech buffer
               userSpeechMessageId.current = null;
               userSpeechBuffer.current = '';
+              // Reset commit timers and counters
+              if (speechStopTimeoutRef.current) {
+                clearTimeout(speechStopTimeoutRef.current);
+                speechStopTimeoutRef.current = null;
+              }
+              if (pendingCreateTimeoutRef.current) {
+                clearTimeout(pendingCreateTimeoutRef.current);
+                pendingCreateTimeoutRef.current = null;
+              }
+              uncommittedSamplesRef.current = 0;
             } else if (message.type === 'input_audio_buffer.speech_stopped') {
               console.log('User speech stopped');
-              // streaming user speech to OpenAI
+              
+              // finalize user text bubble (unchanged)
               if (userSpeechBuffer.current && onAddMessage) {
-                onAddMessage({
-                  role: 'user',
-                  content: userSpeechBuffer.current,
-                  isStreaming: false
-                });
+                onAddMessage({ role: 'user', content: userSpeechBuffer.current, isStreaming: false });
               }
-              // Reset user speech buffer
+
+              // If a response is still in progress, cancel it before the next turn
+              if (responseInProgressRef.current) {
+                wsRef.current!.send(JSON.stringify({ type: "response.cancel" }));
+              }
+
+              // Defer commit slightly to accumulate tail-end audio; ensure >=100ms appended
+              if (speechStopTimeoutRef.current) {
+                clearTimeout(speechStopTimeoutRef.current);
+              }
+              speechStopTimeoutRef.current = window.setTimeout(() => {
+                if (hasUncommittedAudioRef.current && uncommittedSamplesRef.current >= MIN_COMMIT_SAMPLES) {
+                  wsRef.current!.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+                  lastCommitAtRef.current = Date.now();
+                  hasUncommittedAudioRef.current = false;
+                  uncommittedSamplesRef.current = 0;
+                  // Schedule a safe fallback create in case server doesn't auto-create
+                  if (!responseInProgressRef.current) {
+                    if (pendingCreateTimeoutRef.current) {
+                      clearTimeout(pendingCreateTimeoutRef.current);
+                    }
+                    pendingCreateTimeoutRef.current = window.setTimeout(() => {
+                      if (!responseInProgressRef.current) {
+                        wsRef.current!.send(JSON.stringify({ type: "response.create" }));
+                        responseInProgressRef.current = true;
+                      }
+                      pendingCreateTimeoutRef.current = null;
+                    }, CREATE_FALLBACK_MS);
+                  }
+                } else {
+                  console.log('Skipping commit – insufficient audio since last commit', {
+                    hasUncommitted: hasUncommittedAudioRef.current,
+                    samples: uncommittedSamplesRef.current
+                  });
+                }
+                speechStopTimeoutRef.current = null;
+              }, COMMIT_GRACE_MS);
+
               userSpeechMessageId.current = null;
               userSpeechBuffer.current = '';
             } else if (message.type === 'conversation.item.input_audio_transcript.delta') {
@@ -385,12 +485,7 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
           try {
             const inputBuffer = event.data.data;
             
-            // Throttle audio sending to prevent overwhelming the API
-            const now = Date.now();
-            if (now - lastAudioSendTime.current < 100) { // Send max every 100ms
-              return;
-            }
-            lastAudioSendTime.current = now;
+            // Send audio immediately for lowest latency
             
             // Convert Float32Array to PCM16
             const pcm16 = new Int16Array(inputBuffer.length);
@@ -402,35 +497,16 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
             const uint8Array = new Uint8Array(pcm16.buffer);
             const base64Audio = btoa(String.fromCharCode.apply(null, Array.from(uint8Array)));
             
-            // Create conversation item with first audio data if not created yet
-            if (!conversationItemCreated.current) {
-              const startMessage = {
-                type: "conversation.item.create",
-                item: {
-                  type: "message",
-                  role: "user",
-                  content: [
-                    {
-                      type: "input_audio",
-                      audio: base64Audio
-                    }
-                  ]
-                }
-              };
-              
-              console.log('Creating conversation item with first audio data');
-              wsRef.current.send(JSON.stringify(startMessage));
-              conversationItemCreated.current = true;
-            } else {
-              // Append subsequent audio data
-              const audioMessage = {
-                type: "input_audio_buffer.append",
-                audio: base64Audio
-              };
-              
-              console.log('Sending audio message:', { type: audioMessage.type, audioLength: base64Audio.length });
-              wsRef.current.send(JSON.stringify(audioMessage));
-            }
+            // Send every packet as soon as we get it (tiny debounce is fine, but not 100 ms)
+            const audioMessage = {
+              type: "input_audio_buffer.append",
+              audio: base64Audio
+            };
+            
+            hasUncommittedAudioRef.current = true; // mark new audio present
+            uncommittedSamplesRef.current += inputBuffer.length;
+            console.log('Sending audio message:', { type: audioMessage.type, audioLength: base64Audio.length });
+            wsRef.current.send(JSON.stringify(audioMessage));
           } catch (error) {
             console.error('Error processing audio data:', error);
             setState(prev => ({ ...prev, error: 'Audio processing error', isRecording: false }));
@@ -488,6 +564,15 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
       audioContextRef.current = null;
     }
 
+    if (speechStopTimeoutRef.current) {
+      clearTimeout(speechStopTimeoutRef.current);
+      speechStopTimeoutRef.current = null;
+    }
+    if (pendingCreateTimeoutRef.current) {
+      clearTimeout(pendingCreateTimeoutRef.current);
+      pendingCreateTimeoutRef.current = null;
+    }
+
     sessionReadyRef.current = false;
     conversationItemCreated.current = false;
     isInCallActive.current = false;
@@ -496,6 +581,10 @@ export const useAudioStream = (onAddMessage?: (message: { role: string; content:
     currentStreamingContent.current = '';
     userSpeechBuffer.current = '';
     userSpeechMessageId.current = null;
+    hasUncommittedAudioRef.current = false;
+    responseInProgressRef.current = false;
+    uncommittedSamplesRef.current = 0;
+    lastCommitAtRef.current = 0;
 
     setState({
       isConnected: false,
